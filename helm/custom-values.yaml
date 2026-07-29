@@ -3,8 +3,8 @@ executor: KubernetesExecutor
 dags:
   gitSync:
     enabled: true
-    repo: https://github.com/techiescamp/airflow-setup.git
+    repo: https://github.com/Sotatek-NamCan/airflow-setup.git
     branch: main
     subPath: "dags"
     period: 60s
-    credentialsSecret: git-credentials
+    credentialsSecret: git-credentials  
