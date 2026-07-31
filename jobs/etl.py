@@ -1,31 +1,15 @@
+from pyspark.sql import SparkSession
 import argparse
 
-from pyspark.sql import SparkSession
-
-
 parser = argparse.ArgumentParser()
-
-parser.add_argument("--source", required=True)
-parser.add_argument("--destination", required=True)
-
+parser.add_argument("--source")
+parser.add_argument("--destination")
 args = parser.parse_args()
 
+spark = SparkSession.builder.getOrCreate()
 
-spark = (
-    SparkSession.builder
-    .appName("S3ToIceberg")
-    .getOrCreate()
-)
+df = spark.read.option("header", "true").csv(args.source)
 
-print(f"Reading from {args.source}")
-
-df = spark.read.csv(args.source)
-
-# Example transformation
-df = df.dropDuplicates()
-
-print(f"Writing to {args.destination}")
-
-df.writeTo(args.destination).append()
+df.writeTo(args.destination).createOrReplace()
 
 spark.stop()
