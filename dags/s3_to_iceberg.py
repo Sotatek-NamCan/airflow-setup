@@ -1,8 +1,8 @@
 from datetime import datetime
 
 from airflow import DAG
-from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
-from airflow.providers.amazon.aws.sensors.emr import EmrStepSensor
+from airflow.providers.amazon.aws.operators.emr import EmrContainerOperator
+from airflow.providers.amazon.aws.sensors.emr import EmrContainerSensor
 
 SOURCE_PATH = "s3://vna-lab-data-storage/data_sources/csv/"
 DESTINATION_TABLE = "glue_catalog.sales.customer"
