@@ -6,45 +6,44 @@ from airflow.providers.amazon.aws.sensors.emr import EmrContainerSensor
 
 SOURCE_PATH = "s3://vna-lab-data-storage/data_sources/csv/"
 DESTINATION_TABLE = "glue_catalog.sales.customer"
-EMR_CLUSTER_ID = "nqkyosgls6f2u8mtyudzkox41"
+VIRTUAL_CLUSTER_ID = "nqkyosgls6f2u8mtyudzkox41"
 SPARK_SCRIPT = "s3://vna-lab-data-storage/jobs/etl.py"
-
-SPARK_STEPS = [
-    {
-        "Name": "Load S3 to Iceberg",
-        "ActionOnFailure": "CONTINUE",
-        "HadoopJarStep": {
-            "Jar": "command-runner.jar",
-            "Args": [
-                "spark-submit",
-                SPARK_SCRIPT,
-                "--source",
-                SOURCE_PATH,
-                "--destination",
-                DESTINATION_TABLE,
-            ],
-        },
-    }
-]
 
 with DAG(
     dag_id="s3_to_iceberg",
     start_date=datetime(2025, 1, 1),
     schedule=None,
     catchup=False,
-    tags=["emr", "iceberg"],
 ) as dag:
 
-    submit_step = EmrAddStepsOperator(
-        task_id="submit_spark_job",
-        job_flow_id=EMR_CLUSTER_ID,
-        steps=SPARK_STEPS,
+    submit = EmrContainerOperator(
+        task_id="submit_job",
+        virtual_cluster_id=VIRTUAL_CLUSTER_ID,
+        release_label="emr-7.0.0-latest",
+        job_driver={
+            "sparkSubmitJobDriver": {
+                "entryPoint": SPARK_SCRIPT,
+                "entryPointArguments": [
+                    "--source",
+                    SOURCE_PATH,
+                    "--destination",
+                    DESTINATION_TABLE,
+                ],
+            }
+        },
+        configuration_overrides={
+            "monitoringConfiguration": {
+                "s3MonitoringConfiguration": {
+                    "logUri": "s3://vna-lab-data-storage/logs/"
+                }
+            }
+        },
     )
 
-    wait_step = EmrStepSensor(
-        task_id="wait_for_step",
-        job_flow_id=EMR_CLUSTER_ID,
-        step_id="{{ ti.xcom_pull(task_ids='submit_spark_job')[0] }}",
+    wait = EmrContainerSensor(
+        task_id="wait_job",
+        virtual_cluster_id=VIRTUAL_CLUSTER_ID,
+        job_run_id=submit.output,
     )
 
-    submit_step >> wait_step
+    submit >> wait
