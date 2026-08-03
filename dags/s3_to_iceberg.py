@@ -17,9 +17,9 @@ with DAG(
     catchup=False,
 ) as dag:
 
-    submit = EmrContainerOperator(
+    submit = EmrContainerOperator(        
         task_id="submit_job",
-        name="s3-to-iceberg-job",  
+        name="s3-to-iceberg",
         virtual_cluster_id=VIRTUAL_CLUSTER_ID,
         release_label="emr-7.0.0-latest",
         execution_role_arn=EXECUTION_ROLE_ARN,
@@ -41,7 +41,7 @@ with DAG(
         },
     )
 
-    wait = EmrContainerSensor(
+    wait = EmrContainerSensor(            
         task_id="wait_job",
         virtual_cluster_id=VIRTUAL_CLUSTER_ID,
         job_id=submit.output,
@@ -50,4 +50,4 @@ with DAG(
         mode="reschedule",
     )
 
-    submit >> wait
+    submit >> wait                        
