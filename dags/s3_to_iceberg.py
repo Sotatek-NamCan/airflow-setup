@@ -114,7 +114,6 @@ with DAG(
     fetch_logs = PythonOperator(
         task_id="fetch_emr_logs",
         python_callable=print_emr_logs,
-        provide_context=True,
         trigger_rule="all_done",  # runs whether wait_job succeeded or failed
     )
 
