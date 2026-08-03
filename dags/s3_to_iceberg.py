@@ -1,4 +1,5 @@
 from datetime import datetime
+import json
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -14,18 +15,39 @@ SPARK_SCRIPT = "s3://vna-lab-data-storage/jobs/etl.py"
 LOG_BUCKET = "vna-lab-data-storage"
 
 
+def _upload_report(s3, run_id, report):
+    key = f"logs/airflow-reports/{run_id.replace(':', '-').replace('+', '')}.json"
+    s3.load_string(
+        string_data=json.dumps(report, indent=2),
+        key=key,
+        bucket_name=LOG_BUCKET,
+        replace=True,
+    )
+    print(f"Report uploaded to s3://{LOG_BUCKET}/{key}")
+
+
 def print_emr_logs(**context):
-    job_id = context["ti"].xcom_pull(task_ids="submit_job")
-    
+    ti = context["ti"]
+    job_id = ti.xcom_pull(task_ids="submit_job")
+    run_id = context["run_id"]
+
+    s3 = S3Hook(aws_conn_id="aws_default")
+
+    report = {
+        "run_id": run_id,
+        "job_id": job_id,
+        "checked_at": datetime.utcnow().isoformat(),
+        "logs": {},
+    }
+
     if not job_id:
-        print("No job ID found in XCom — cannot fetch logs.")
+        report["error"] = "No job ID found in XCom — submit_job may have failed."
+        _upload_report(s3, run_id, report)
+        print(report["error"])
         return
 
     print(f"Fetching logs for EMR job: {job_id}")
 
-    s3 = S3Hook(aws_conn_id="aws_default")
-
-    # EMR on EKS writes logs under this prefix structure
     prefixes_to_try = [
         f"logs/jobs/{job_id}/",
         f"logs/{job_id}/",
@@ -33,42 +55,53 @@ def print_emr_logs(**context):
     ]
 
     keys = []
+    matched_prefix = None
     for prefix in prefixes_to_try:
         print(f"Trying prefix: s3://{LOG_BUCKET}/{prefix}")
         found = s3.list_keys(bucket_name=LOG_BUCKET, prefix=prefix)
         if found:
             keys = found
-            print(f"Found {len(keys)} log file(s) under {prefix}")
+            matched_prefix = prefix
+            print(f"Found {len(keys)} file(s) under {prefix}")
             break
 
     if not keys:
-        print(
+        report["error"] = (
             f"No logs found for job {job_id}. "
-            f"The job may still be running, or the log path may differ. "
+            f"Tried prefixes: {prefixes_to_try}. "
             f"Check s3://{LOG_BUCKET}/logs/ manually."
         )
+        _upload_report(s3, run_id, report)
+        print(report["error"])
         return
 
+    report["log_prefix"] = matched_prefix
+
     for key in keys:
-        # Only print readable log files, skip large binary/jar files
-        if not any(key.endswith(ext) for ext in [".log", ".out", ".err", ".gz", "stdout", "stderr"]):
+        if not any(key.endswith(ext) for ext in [".log", ".out", ".err", "stdout", "stderr"]):
             print(f"Skipping non-log file: {key}")
             continue
 
         print(f"\n{'='*60}")
         print(f"FILE: s3://{LOG_BUCKET}/{key}")
-        print('='*60)
+        print("=" * 60)
 
         try:
             content = s3.read_key(key=key, bucket_name=LOG_BUCKET)
-            # Truncate very large files to avoid flooding the log
             if len(content) > 50_000:
-                print(content[:50_000])
+                truncated = content[:50_000]
+                print(truncated)
                 print(f"\n... [truncated — full log at s3://{LOG_BUCKET}/{key}]")
+                report["logs"][key] = truncated + "\n... [truncated]"
             else:
                 print(content)
+                report["logs"][key] = content
         except Exception as e:
-            print(f"Could not read {key}: {e}")
+            msg = f"Could not read {key}: {e}"
+            print(msg)
+            report["logs"][key] = msg
+
+    _upload_report(s3, run_id, report)
 
 
 with DAG(
@@ -114,7 +147,7 @@ with DAG(
     fetch_logs = PythonOperator(
         task_id="fetch_emr_logs",
         python_callable=print_emr_logs,
-        trigger_rule="all_done",  # runs whether wait_job succeeded or failed
+        trigger_rule="all_done",
     )
 
     submit >> wait >> fetch_logs
