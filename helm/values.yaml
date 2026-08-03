@@ -1,3 +1,7 @@
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::606876783566:role/iceberg-demo-mwaa-execution
+
 config:
   logging:
     remote_logging: "True"
