@@ -1,10 +1,6 @@
-executor: KubernetesExecutor
-
-dags:
-  gitSync:
-    enabled: true
-    repo: https://github.com/Sotatek-NamCan/airflow-setup.git
-    branch: main
-    subPath: "dags"
-    period: 60s
-    credentialsSecret: git-credentials  
+config:
+  logging:
+    remote_logging: "True"
+    remote_base_log_folder: "s3://vna-lab-data-storage/logs/airflow"
+    remote_log_conn_id: "aws_default"
+    encrypt_s3_logs: "False"
