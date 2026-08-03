@@ -1,10 +1,7 @@
-from datetime import datetime
-
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.operators.emr import EmrContainerOperator
-from airflow.providers.amazon.aws.sensors.emr import EmrContainerSensor
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+import datetime
+from airflow.sdk import DAG
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+from kubernetes.client import models as k8s
 
 SOURCE_PATH = "s3://vna-lab-data-storage/data_sources/csv/"
 DESTINATION_TABLE = "glue_catalog.sales.customer"
@@ -13,108 +10,114 @@ EXECUTION_ROLE_ARN = "arn:aws:iam::606876783566:role/iceberg-demo-mwaa-execution
 SPARK_SCRIPT = "s3://vna-lab-data-storage/jobs/etl.py"
 LOG_BUCKET = "vna-lab-data-storage"
 
+RESOURCES = k8s.V1ResourceRequirements(
+    requests={"memory": "256Mi", "cpu": "100m"},
+    limits={"memory": "512Mi", "cpu": "500m"},
+)
 
-def print_emr_logs(**context):
-    job_id = context["ti"].xcom_pull(task_ids="submit_job")
-    
-    if not job_id:
-        print("No job ID found in XCom — cannot fetch logs.")
-        return
+EMR_SCRIPT = f"""
+set -e
 
-    print(f"Fetching logs for EMR job: {job_id}")
+echo "=== Submitting EMR job ==="
+echo "Virtual Cluster : {VIRTUAL_CLUSTER_ID}"
+echo "Spark Script    : {SPARK_SCRIPT}"
+echo "Source Path     : {SOURCE_PATH}"
+echo "Destination     : {DESTINATION_TABLE}"
+echo ""
 
-    s3 = S3Hook(aws_conn_id="aws_default")
+JOB_ID=$(aws emr-containers start-job-run \
+  --virtual-cluster-id {VIRTUAL_CLUSTER_ID} \
+  --name s3-to-iceberg-job \
+  --execution-role-arn {EXECUTION_ROLE_ARN} \
+  --release-label emr-7.0.0-latest \
+  --job-driver '{{
+    "sparkSubmitJobDriver": {{
+      "entryPoint": "{SPARK_SCRIPT}",
+      "entryPointArguments": [
+        "--source", "{SOURCE_PATH}",
+        "--destination", "{DESTINATION_TABLE}"
+      ]
+    }}
+  }}' \
+  --configuration-overrides '{{
+    "monitoringConfiguration": {{
+      "s3MonitoringConfiguration": {{
+        "logUri": "s3://{LOG_BUCKET}/logs/"
+      }}
+    }}
+  }}' \
+  --query 'id' \
+  --output text)
 
-    # EMR on EKS writes logs under this prefix structure
-    prefixes_to_try = [
-        f"logs/jobs/{job_id}/",
-        f"logs/{job_id}/",
-        f"logs/jobRuns/{job_id}/",
-    ]
+if [ -z "$JOB_ID" ]; then
+  echo "ERROR: Failed to submit EMR job — no job ID returned."
+  exit 1
+fi
 
-    keys = []
-    for prefix in prefixes_to_try:
-        print(f"Trying prefix: s3://{LOG_BUCKET}/{prefix}")
-        found = s3.list_keys(bucket_name=LOG_BUCKET, prefix=prefix)
-        if found:
-            keys = found
-            print(f"Found {len(keys)} log file(s) under {prefix}")
-            break
+echo "Job submitted successfully: $JOB_ID"
+echo ""
 
-    if not keys:
-        print(
-            f"No logs found for job {job_id}. "
-            f"The job may still be running, or the log path may differ. "
-            f"Check s3://{LOG_BUCKET}/logs/ manually."
-        )
-        return
+# Poll until job reaches a terminal state
+POLL_INTERVAL=30
+ELAPSED=0
+TIMEOUT=3600
 
-    for key in keys:
-        # Only print readable log files, skip large binary/jar files
-        if not any(key.endswith(ext) for ext in [".log", ".out", ".err", ".gz", "stdout", "stderr"]):
-            print(f"Skipping non-log file: {key}")
-            continue
+echo "=== Polling job status every ${{POLL_INTERVAL}}s (timeout: ${{TIMEOUT}}s) ==="
 
-        print(f"\n{'='*60}")
-        print(f"FILE: s3://{LOG_BUCKET}/{key}")
-        print('='*60)
+while true; do
+  DESCRIBE=$(aws emr-containers describe-job-run \
+    --virtual-cluster-id {VIRTUAL_CLUSTER_ID} \
+    --id $JOB_ID)
 
-        try:
-            content = s3.read_key(key=key, bucket_name=LOG_BUCKET)
-            # Truncate very large files to avoid flooding the log
-            if len(content) > 50_000:
-                print(content[:50_000])
-                print(f"\n... [truncated — full log at s3://{LOG_BUCKET}/{key}]")
-            else:
-                print(content)
-        except Exception as e:
-            print(f"Could not read {key}: {e}")
+  STATE=$(echo $DESCRIBE | python3 -c "import sys,json; print(json.load(sys.stdin)['jobRun']['state'])")
+  STATE_DETAILS=$(echo $DESCRIBE | python3 -c "import sys,json; print(json.load(sys.stdin)['jobRun'].get('stateDetails', 'N/A'))")
 
+  echo "[$(date -u +%H:%M:%S)] Job $JOB_ID — state: $STATE"
+
+  if [ "$STATE" = "COMPLETED" ]; then
+    echo ""
+    echo "=== Job completed successfully ==="
+    exit 0
+
+  elif [ "$STATE" = "FAILED" ]; then
+    echo ""
+    echo "=== Job FAILED ==="
+    echo "State details : $STATE_DETAILS"
+    echo ""
+    echo "=== Full describe output ==="
+    echo $DESCRIBE | python3 -m json.tool
+    exit 1
+
+  elif [ "$STATE" = "CANCELLED" ] || [ "$STATE" = "CANCEL_PENDING" ]; then
+    echo ""
+    echo "=== Job was CANCELLED ==="
+    echo "State details : $STATE_DETAILS"
+    exit 1
+  fi
+
+  # Check timeout
+  ELAPSED=$((ELAPSED + POLL_INTERVAL))
+  if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo ""
+    echo "=== ERROR: Timed out after ${{TIMEOUT}}s waiting for job $JOB_ID ==="
+    exit 1
+  fi
+
+  sleep $POLL_INTERVAL
+done
+"""
 
 with DAG(
     dag_id="s3_to_iceberg",
-    start_date=datetime(2025, 1, 1),
+    start_date=datetime.datetime(2025, 1, 1),
     schedule=None,
     catchup=False,
-) as dag:
-
-    submit = EmrContainerOperator(
-        task_id="submit_job",
-        name="s3-to-iceberg-job",
-        virtual_cluster_id=VIRTUAL_CLUSTER_ID,
-        release_label="emr-7.0.0-latest",
-        execution_role_arn=EXECUTION_ROLE_ARN,
-        job_driver={
-            "sparkSubmitJobDriver": {
-                "entryPoint": SPARK_SCRIPT,
-                "entryPointArguments": [
-                    "--source", SOURCE_PATH,
-                    "--destination", DESTINATION_TABLE,
-                ],
-            }
-        },
-        configuration_overrides={
-            "monitoringConfiguration": {
-                "s3MonitoringConfiguration": {
-                    "logUri": f"s3://{LOG_BUCKET}/logs/"
-                }
-            }
-        },
+):
+    submit_and_wait = KubernetesPodOperator(
+        task_id="submit_and_wait",
+        image="amazon/aws-cli:latest",
+        cmds=["bash", "-c"],
+        arguments=[EMR_SCRIPT],
+        container_resources=RESOURCES,
+        on_finish_action="keep_pod",
     )
-
-    wait = EmrContainerSensor(
-        task_id="wait_job",
-        virtual_cluster_id=VIRTUAL_CLUSTER_ID,
-        job_id=submit.output,
-        poll_interval=30,
-        timeout=3600,
-        mode="reschedule",
-    )
-
-    fetch_logs = PythonOperator(
-        task_id="fetch_emr_logs",
-        python_callable=print_emr_logs,
-        trigger_rule="all_done",  # runs whether wait_job succeeded or failed
-    )
-
-    submit >> wait >> fetch_logs
